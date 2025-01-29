@@ -29,4 +29,12 @@ inline __constant__ int CHUNK_FIRST_ELEMENT[NUM_GTABLE_CHUNK] = {
   65536*12, 65536*13, 65536*14, 65536*15,
 };
 
+struct CUDAStream {
+    cudaStream_t stream;
+    unsigned char *d_private_key;
+    unsigned char *d_bitcoin_address;
+    int *d_match_found;
+    bool in_use;
+};
+
 #endif // GPU_CONSTANTS_H

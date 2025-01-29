@@ -108,81 +108,73 @@ __device__ void increment_private_key_gpu(unsigned char *private_key, uint64_t i
 // Kernel otimizado para processar múltiplas chaves em paralelo
 __global__ void bitcoin_address_kernel(unsigned char* private_key, unsigned char* bitcoin_address, 
                                      const unsigned char* target_address, int* match_found,
-                                     uint8_t* gTableX, uint8_t* gTableY) {
+                                     uint8_t* gTableX, uint8_t* gTableY,
+                                     int keys_per_thread) {
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (*match_found) return;
-
-    // Buffer local para a chave privada
-    unsigned char local_private_key[32];
-    memcpy(local_private_key, private_key, 32);
     
-    // Incrementa a chave baseado no thread ID
-    increment_private_key_gpu(local_private_key, tid);
-
-    // Buffers para as hashes
-    unsigned char sha256_hash[SHA256_DIGEST_SIZE];
-    unsigned char ripemd160_hash[RIPEMD160_DIGEST_SIZE];
-    unsigned char public_key[33];  // Compressed public key format
-
-    // Converter a chave privada para o formato correto
-    uint16_t privKeyChunks[NUM_GTABLE_CHUNK] = {0};
+    // Memória compartilhada para tabelas G frequentemente acessadas
+    __shared__ uint8_t shared_gTableX[1024];
+    __shared__ uint8_t shared_gTableY[1024];
     
-    // Converter similar ao kernel host
-    uint16_t* privKeyShorts = (uint16_t*)local_private_key;
-    for (int i = 0; i < 16; i++) {
-        // Reverse bytes e inverte a ordem dos chunks
-        uint16_t value = privKeyShorts[i];
-        value = ((value & 0xFF00) >> 8) | ((value & 0x00FF) << 8); // reverseBytes16
-        privKeyChunks[15 - i] = value;
+    // Carregar dados frequentemente acessados na memória compartilhada
+    if (threadIdx.x < 1024) {
+        shared_gTableX[threadIdx.x] = gTableX[threadIdx.x];
+        shared_gTableY[threadIdx.x] = gTableY[threadIdx.x];
     }
+    __syncthreads();
 
-    // Gerar public key usando as tabelas G
-    uint64_t pubX[4], pubY[4];
-    _PointMultiSecp256k1(pubX, pubY, privKeyChunks, gTableX, gTableY);
-
-    // Converter para formato comprimido (33 bytes)
-    public_key[0] = 0x02 | (pubY[0] & 1);
-    for (int i = 0; i < 32; i++) {
-        public_key[i+1] = ((unsigned char*)pubX)[31-i];
-    }
-
-    // Calcular hashes
-    sha256_gpu(public_key, 33, sha256_hash);
-    ripemd160_gpu(sha256_hash, SHA256_DIGEST_SIZE, ripemd160_hash);
-
-    // Verificar match
-    bool match = true;
-    for (int i = 0; i < RIPEMD160_DIGEST_SIZE; i++) {
-        if (ripemd160_hash[i] != target_address[i]) {
-            match = false;
-            break;
-        }
-    }
-
-    // if (tid == 0) {
-    //     printf("\n=== Primeiro Endereço ===\n");
-    //     printf("Private Key: ");
-    //     for (int i = 0; i < 32; i++) {
-    //         printf("%02x", local_private_key[i]);
-    //     }
+    for(int i = 0; i < keys_per_thread && !(*match_found); i++) {
+        // Buffer local para a chave privada
+        unsigned char local_private_key[32];
+        memcpy(local_private_key, private_key, 32);
         
-    //     printf("\nPublic Key (compressed): ");
-    //     for (int i = 0; i < 33; i++) {
-    //         printf("%02x", public_key[i]);
-    //     }
+        // Incrementa a chave baseado no thread ID e iteração
+        increment_private_key_gpu(local_private_key, tid + (i * gridDim.x * blockDim.x));
 
-    //     printf("\nHash RIPEMD160: ");
-    //     for (int i = 0; i < RIPEMD160_DIGEST_SIZE; i++) {
-    //         printf("%02x", ripemd160_hash[i]);
-    //     }
-    //     printf("\n======================\n");
-    // }
+        // Buffers para as hashes
+        unsigned char sha256_hash[SHA256_DIGEST_SIZE];
+        unsigned char ripemd160_hash[RIPEMD160_DIGEST_SIZE];
+        unsigned char public_key[33];  // Compressed public key format
 
-    if (match) {
-        atomicExch(match_found, 1);
-        memcpy(bitcoin_address, ripemd160_hash, RIPEMD160_DIGEST_SIZE);
-        // Salvar a chave privada que gerou o match
-        memcpy(private_key, local_private_key, 32);
+        // Converter a chave privada para o formato correto
+        uint16_t privKeyChunks[NUM_GTABLE_CHUNK] = {0};
+        
+        // Converter similar ao kernel host
+        uint16_t* privKeyShorts = (uint16_t*)local_private_key;
+        for (int j = 0; j < 16; j++) {
+            uint16_t value = privKeyShorts[j];
+            value = ((value & 0xFF00) >> 8) | ((value & 0x00FF) << 8);
+            privKeyChunks[15 - j] = value;
+        }
+
+        // Gerar public key usando as tabelas G
+        uint64_t pubX[4], pubY[4];
+        _PointMultiSecp256k1(pubX, pubY, privKeyChunks, gTableX, gTableY);
+
+        // Converter para formato comprimido (33 bytes)
+        public_key[0] = 0x02 | (pubY[0] & 1);
+        for (int j = 0; j < 32; j++) {
+            public_key[j+1] = ((unsigned char*)pubX)[31-j];
+        }
+
+        // Calcular hashes
+        sha256_gpu(public_key, 33, sha256_hash);
+        ripemd160_gpu(sha256_hash, SHA256_DIGEST_SIZE, ripemd160_hash);
+
+        // Verificar match
+        bool match = true;
+        for (int j = 0; j < RIPEMD160_DIGEST_SIZE; j++) {
+            if (ripemd160_hash[j] != target_address[j]) {
+                match = false;
+                break;
+            }
+        }
+
+        if (match) {
+            atomicExch(match_found, 1);
+            memcpy(bitcoin_address, ripemd160_hash, RIPEMD160_DIGEST_SIZE);
+            memcpy(private_key, local_private_key, 32);
+        }
     }
 }
 
@@ -216,7 +208,10 @@ const char* formatSpeed(double speed) {
 
 int main(int argc, char **argv) {
     int blockSize = 256;  // default
-    int numBlocks = 2048; // default
+    int numBlocks = 4096; // aumentado
+    int numStreams = 8;   // default
+    int keysPerThread = 1;  // default
+    const int BATCH_SIZE = 16; // novo parâmetro para batch processing
     
     // Chave privada default
     unsigned char private_key[32] = {
@@ -236,6 +231,14 @@ int main(int argc, char **argv) {
             numBlocks = atoi(argv[i + 1]);
             i++;
         }
+        else if (strcmp(argv[i], "-streams") == 0 && i + 1 < argc) {
+            numStreams = atoi(argv[i + 1]);
+            i++;
+        }
+        else if (strcmp(argv[i], "-keys") == 0 && i + 1 < argc) {
+            keysPerThread = atoi(argv[i + 1]);
+            i++;
+        }
         else if (strcmp(argv[i], "-private") == 0 && i + 1 < argc) {
             if (!hex_to_bytes(argv[i + 1], private_key, 32)) {
                 printf("Erro: chave privada inválida. Use 64 caracteres hexadecimais\n");
@@ -243,6 +246,18 @@ int main(int argc, char **argv) {
             }
             i++;
         }
+    }
+
+    // Validar parâmetros
+    if (keysPerThread <= 0 || keysPerThread > 16) {
+        printf("Erro: keys per thread deve estar entre 1 e 16\n");
+        return 1;
+    }
+
+    // Validar parâmetros
+    if (numStreams <= 0 || numStreams > 32) {
+        printf("Erro: número de streams deve estar entre 1 e 32\n");
+        return 1;
     }
 
     // Validar parâmetros
@@ -258,6 +273,8 @@ int main(int argc, char **argv) {
     printf("Configuração:\n");
     printf("Block Size: %d\n", blockSize);
     printf("Grid Size: %d\n", numBlocks);
+    printf("Num Streams: %d\n", numStreams);
+    printf("Keys per Thread: %d\n", keysPerThread);
     printf("Total Threads: %d\n", blockSize * numBlocks);
     printf("Private Key Inicial: ");
     for (int i = 0; i < 32; i++) {
@@ -272,100 +289,155 @@ int main(int argc, char **argv) {
     }
 
     unsigned char bitcoin_address[RIPEMD160_DIGEST_SIZE];
-
     unsigned char target_bitcoin_address[RIPEMD160_DIGEST_SIZE] = {
         0x20, 0xd4, 0x5a, 0x6a, 0x76, 0x25, 0x35, 0x70, 
         0x0c, 0xe9, 0xe0, 0xb2, 0x16, 0xe3, 0x19, 0x94, 
         0x33, 0x5d, 0xb8, 0xa5  
     };
 
-    // Alocação de memória na GPU
-    unsigned char *d_private_key;
-    unsigned char *d_bitcoin_address;
+    // Alocar memória pinned na CPU para transferências mais rápidas
+    unsigned char *host_private_key;
+    unsigned char *host_bitcoin_address;
+    cudaHostAlloc(&host_private_key, 32, cudaHostAllocDefault);
+    cudaHostAlloc(&host_bitcoin_address, RIPEMD160_DIGEST_SIZE, cudaHostAllocDefault);
+    memcpy(host_private_key, private_key, 32);
+
+    // Alocar memória para o endereço target (compartilhado entre streams)
     unsigned char *d_target_address;
-    int *d_match_found;
-    
-    cudaMalloc(&d_private_key, 32);
-    cudaMalloc(&d_bitcoin_address, RIPEMD160_DIGEST_SIZE);
     cudaMalloc(&d_target_address, RIPEMD160_DIGEST_SIZE);
-    cudaMalloc(&d_match_found, sizeof(int));
 
-    // Copiar dados para a GPU
-    cudaMemcpy(d_target_address, target_bitcoin_address, RIPEMD160_DIGEST_SIZE, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_private_key, private_key, 32, cudaMemcpyHostToDevice);
+    const int NUM_STREAMS = numStreams;
+    const int KEYS_PER_THREAD = keysPerThread;
+    CUDAStream streams[NUM_STREAMS];
 
-    const int TOTAL_THREADS = blockSize * numBlocks;
+    // Inicializar streams
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        cudaStreamCreate(&streams[i].stream);
+        cudaMalloc(&streams[i].d_private_key, 32);
+        cudaMalloc(&streams[i].d_bitcoin_address, RIPEMD160_DIGEST_SIZE);
+        cudaMalloc(&streams[i].d_match_found, sizeof(int));
+        streams[i].in_use = false;
+    }
+
+    cudaMemcpyAsync(d_target_address, target_bitcoin_address, 
+                    RIPEMD160_DIGEST_SIZE, cudaMemcpyHostToDevice, streams[0].stream);
+
+    const uint64_t TOTAL_THREADS = blockSize * numBlocks;
+    const uint64_t TOTAL_THREADS_PER_BATCH = TOTAL_THREADS * BATCH_SIZE;
+    int current_stream = 0;
     
     // Variáveis para estatísticas
     int match_found_host = 0;
     clock_t start_time = clock();
     uint64_t addresses_processed = 0;
-    int display_interval = 5;
+    uint64_t total_addresses_processed = 0;
+    int display_interval = 1;
+    clock_t search_start_time = clock();
 
     while (!match_found_host) {
-        // Resetar flag de match
-        cudaMemset(d_match_found, 0, sizeof(int));
+        // Verificar streams completados
+        for (int i = 0; i < NUM_STREAMS; i++) {
+            if (streams[i].in_use) {
+                cudaError_t err = cudaStreamQuery(streams[i].stream);
+                if (err == cudaSuccess) {
+                    int stream_match = 0;
+                    cudaMemcpyAsync(&stream_match, streams[i].d_match_found,
+                                   sizeof(int), cudaMemcpyDeviceToHost, streams[i].stream);
+                    
+                    if (stream_match) {
+                        match_found_host = 1;
+                        current_stream = i;
+                        break;
+                    }
+                    streams[i].in_use = false;
+                }
+            }
+        }
 
-        // Lançar kernel
-        bitcoin_address_kernel<<<numBlocks, blockSize>>>(
-            d_private_key, d_bitcoin_address, d_target_address, 
-            d_match_found, d_gTableX, d_gTableY
+        if (streams[current_stream].in_use) {
+            continue;
+        }
+
+        cudaMemsetAsync(streams[current_stream].d_match_found, 0, sizeof(int), 
+                       streams[current_stream].stream);
+
+        cudaMemcpyAsync(streams[current_stream].d_private_key, host_private_key,
+                       32, cudaMemcpyHostToDevice, streams[current_stream].stream);
+
+        bitcoin_address_kernel<<<numBlocks, blockSize, 0, streams[current_stream].stream>>>(
+            streams[current_stream].d_private_key,
+            streams[current_stream].d_bitcoin_address,
+            d_target_address,
+            streams[current_stream].d_match_found,
+            d_gTableX,
+            d_gTableY,
+            keysPerThread
         );
 
-        // Verificar erros
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             printf("Erro no kernel: %s\n", cudaGetErrorString(err));
-            break;
         }
 
-        // Sincronizar e verificar resultado
-        cudaDeviceSynchronize();
-        cudaMemcpy(&match_found_host, d_match_found, sizeof(int), cudaMemcpyDeviceToHost);
+        streams[current_stream].in_use = true;
 
-        if (match_found_host) {
-            // Recuperar a chave privada e o endereço encontrado
-            cudaMemcpy(private_key, d_private_key, 32, cudaMemcpyDeviceToHost);
-            cudaMemcpy(bitcoin_address, d_bitcoin_address, RIPEMD160_DIGEST_SIZE, cudaMemcpyDeviceToHost);
-            
-            printf("Chave encontrada: ");
-            for (int i = 0; i < 32; i++) {
-                printf("%02x", private_key[i]);
-            }
-            printf("\n");
-            break;
-        }
-
-        // Incrementar a chave inicial pelo número total de threads
-        uint64_t carry = TOTAL_THREADS;
+        // Incrementar a chave para o próximo batch
+        uint64_t carry = TOTAL_THREADS * KEYS_PER_THREAD;
         for (int i = 31; i >= 0 && carry > 0; i--) {
-            uint64_t sum = (uint64_t)private_key[i] + carry;
-            private_key[i] = sum & 0xFF;
+            uint64_t sum = (uint64_t)host_private_key[i] + carry;
+            host_private_key[i] = sum & 0xFF;
             carry = sum >> 8;
         }
 
-        // Atualizar a chave na GPU
-        cudaMemcpy(d_private_key, private_key, 32, cudaMemcpyHostToDevice);
-
-        addresses_processed += TOTAL_THREADS;
+        addresses_processed += TOTAL_THREADS * KEYS_PER_THREAD;
+        total_addresses_processed += TOTAL_THREADS * KEYS_PER_THREAD;
 
         // Estatísticas de performance
         clock_t current_time = clock();
         double elapsed_time = (double)(current_time - start_time) / CLOCKS_PER_SEC;
         if (elapsed_time >= display_interval) {
             double keys_per_second = addresses_processed / elapsed_time;
-            printf("\rVelocidade: %s", formatSpeed(keys_per_second));
-            fflush(stdout);  // Força a atualização do output
+            printf("\rVelocidade: %s | Total processado: %lu", 
+                   formatSpeed(keys_per_second), 
+                   total_addresses_processed);
+            fflush(stdout);
             start_time = clock();
             addresses_processed = 0;
         }
+
+        current_stream = (current_stream + 1) % NUM_STREAMS;
+    }
+
+    clock_t search_end_time = clock();
+    double total_search_time = (double)(search_end_time - search_start_time) / CLOCKS_PER_SEC;
+    double avg_speed = total_addresses_processed / total_search_time;
+
+    if (match_found_host) {
+        printf("\nTempo total de busca: %.2f segundos\n", total_search_time);
+        printf("Velocidade média: %s\n", formatSpeed(avg_speed));
+        cudaMemcpyAsync(private_key, streams[current_stream].d_private_key,
+                      32, cudaMemcpyDeviceToHost, streams[current_stream].stream);
+        printf("Chave encontrada: ");
+        for (int i = 0; i < 32; i++) {
+            printf("%02x", private_key[i]);
+        }
+        printf("\n");
+    } else {
+        printf("\nChave não encontrada após %.2f segundos\n", total_search_time);
     }
 
     // Cleanup
-    cudaFree(d_private_key);
-    cudaFree(d_bitcoin_address);
+    cudaFreeHost(host_private_key);
+    cudaFreeHost(host_bitcoin_address);
+    
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        cudaStreamSynchronize(streams[i].stream);
+        cudaFree(streams[i].d_private_key);
+        cudaFree(streams[i].d_bitcoin_address);
+        cudaFree(streams[i].d_match_found);
+        cudaStreamDestroy(streams[i].stream);
+    }
     cudaFree(d_target_address);
-    cudaFree(d_match_found);
     freeGPUTables();
 
     return 0;

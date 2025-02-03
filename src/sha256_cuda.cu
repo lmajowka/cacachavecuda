@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <cuda_runtime.h>
+#include "sha256_cuda.cuh"
 
 #define SHA256_BLOCK_SIZE 64  // 512 bits
 #define SHA256_DIGEST_SIZE 32  // 256 bits

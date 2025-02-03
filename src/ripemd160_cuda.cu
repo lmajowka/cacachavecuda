@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ripemd160_cuda.cuh"
 
 #define RIPEMD160_DIGEST_SIZE 20
 

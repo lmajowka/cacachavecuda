@@ -182,7 +182,8 @@ uint64_t Int::AddC(Int* a) {
 void Int::AddAndShift(Int* a,Int* b,uint64_t cH) {
 
   unsigned char c = 0;
-  c = _addcarry_u64(c,b->bits64[0],a->bits64[0],bits64 + 0);
+  uint64_t tmp;
+  c = _addcarry_u64(c,b->bits64[0],a->bits64[0],&tmp);
   c = _addcarry_u64(c,b->bits64[1],a->bits64[1],bits64 + 0);
   c = _addcarry_u64(c,b->bits64[2],a->bits64[2],bits64 + 1);
   c = _addcarry_u64(c,b->bits64[3],a->bits64[3],bits64 + 2);
